@@ -26,8 +26,61 @@
             <input id="lang" type="text" value="auto" />
         </label>
         <label>
-            <input type="checkbox" id="speakerVerification"> Speaker Verification
+            mode: 
+            <select id="mode">
+                <option value="offline">Offline (默认)</option>
+                <option value="online">Online (快速)</option>
+                <option value="2pass">2Pass (快速+精确)</option>
+            </select>
         </label>
+        <br>
+        <label>
+            热词 (用空格分隔): 
+            <input id="hotwords" type="text" placeholder="例如: 阿里巴巴 魔搭 达摩院" style="width: 300px;" />
+        </label>
+        <div>
+            <label>
+                <input type="checkbox" id="speakerVerification"> Speaker Verification
+            </label>
+            <div id="speakerSelection" style="margin-left: 20px; margin-top: 5px; display: none;">
+                <div style="font-size: 12px; color: #666; margin-bottom: 5px;">选择要验证的说话人:</div>
+                <div id="speakerList"></div>
+                <button id="refreshSpeakers" style="margin-top: 5px; font-size: 12px;">刷新说话人列表</button>
+            </div>
+        </div>
+        
+        <!-- 音频录制和上传功能 -->
+        <div id="audioSection" style="margin-top: 15px; padding: 10px; border: 1px solid #ccc; border-radius: 5px;">
+            <h3>音频录制与上传</h3>
+            
+            <!-- 音频文件名输入 -->
+            <div style="margin-bottom: 10px;">
+                <label>音频文件名: 
+                    <input id="audioFileName" type="text" placeholder="输入文件名（不含扩展名）" />
+                </label>
+            </div>
+            
+            <!-- 功能1：上传音频文件 -->
+            <div style="margin-bottom: 15px;">
+                <label>上传音频文件: 
+                    <input type="file" id="audioFileInput" accept="audio/*" />
+                </label>
+                <button id="uploadButton" disabled>上传并转换</button>
+            </div>
+            
+            <!-- 功能2：实时录制音频 -->
+            <div style="margin-bottom: 15px;">
+                <button id="recordAudioButton">开始录制音频</button>
+                <button id="saveAudioButton" disabled>保存录制的音频</button>
+                <span id="recordingStatus"></span>
+            </div>
+            
+            <!-- 录制状态显示 -->
+            <div id="audioRecordingInfo" style="font-size: 12px; color: #666;">
+                音频要求：16000Hz 采样率，单声道，16位，WAV格式
+            </div>
+        </div>
+        
         <hr />
         Transcription result will be displayed below:
         <p id="transcriptionResult"></p>
@@ -41,6 +94,18 @@
     var record = null;
     var timeInte = null;
     var isRecording = false;
+    
+    // 音频录制相关变量
+    var audioRecorder = null;
+    var isRecordingAudio = false;
+    var recordedAudioData = null;
+    
+    // 说话人验证相关变量
+    var availableSpeakers = [];
+    
+    // 2pass 相关变量
+    var rec_text = "";          // 当前显示的文本
+    var offline_text = "";      // 离线结果文本
 
     recordButton.onclick = function() {
         if (!isRecording) {
@@ -50,22 +115,100 @@
         }
     };
 
+    // 音频文件上传功能
+    document.getElementById('audioFileInput').onchange = function() {
+        var uploadButton = document.getElementById('uploadButton');
+        uploadButton.disabled = !this.files.length;
+    };
+
+    document.getElementById('uploadButton').onclick = function() {
+        var fileInput = document.getElementById('audioFileInput');
+        var fileName = document.getElementById('audioFileName').value.trim();
+        
+        if (!fileInput.files.length) {
+            alert('请选择音频文件');
+            return;
+        }
+        
+        if (!fileName) {
+            alert('请输入文件名');
+            return;
+        }
+        
+        var file = fileInput.files[0];
+        convertAndUploadAudio(file, fileName);
+    };
+
+    // 音频录制功能
+    document.getElementById('recordAudioButton').onclick = function() {
+        if (!isRecordingAudio) {
+            startAudioRecording();
+        } else {
+            stopAudioRecording();
+        }
+    };
+
+    document.getElementById('saveAudioButton').onclick = function() {
+        var fileName = document.getElementById('audioFileName').value.trim();
+        
+        if (!fileName) {
+            alert('请输入文件名');
+            return;
+        }
+        
+        if (!recordedAudioData) {
+            alert('没有录制的音频数据');
+            return;
+        }
+        
+        saveRecordedAudio(fileName);
+    };
+
+    // 说话人验证相关事件
+    document.getElementById('speakerVerification').onchange = function() {
+        var speakerSelection = document.getElementById('speakerSelection');
+        if (this.checked) {
+            speakerSelection.style.display = 'block';
+            loadSpeakers();
+        } else {
+            speakerSelection.style.display = 'none';
+        }
+    };
+
+    document.getElementById('refreshSpeakers').onclick = function() {
+        loadSpeakers();
+    };
+
     function startRecording() {
         console.log('Start Recording');
         var speakerVerificationCheckbox = document.getElementById('speakerVerification');
         var sv = speakerVerificationCheckbox.checked ? 1 : 0;
-        var lang = document.getElementById("lang").value
+        var lang = document.getElementById("lang").value;
+        var mode = document.getElementById("mode").value;
+        var hotwords = document.getElementById("hotwords").value.trim();
+        
         // Construct the query parameters
         var queryParams = [];
         if (lang) {
-            queryParams.push(`lang=${lang}`);
+            queryParams.push(`lang=${encodeURIComponent(lang)}`);
+        }
+        if (mode) {
+            queryParams.push(`mode=${encodeURIComponent(mode)}`);
+        }
+        if (hotwords) {
+            queryParams.push(`hotwords=${encodeURIComponent(hotwords)}`);
         }
         if (sv) {
             queryParams.push('sv=1');
+            // 添加选择的说话人
+            var selectedSpeakers = getSelectedSpeakers();
+            if (selectedSpeakers.length > 0) {
+                queryParams.push('speakers=' + selectedSpeakers.join(','));
+            }
         }
         var queryString = queryParams.length > 0 ? `?${queryParams.join('&')}` : '';
-
-        ws = new WebSocket(`wss://your_wss_server_address/ws/transcribe${queryString}`);
+        // wss -》https ws -> http
+        ws = new WebSocket(`ws://localhost:27000/ws/transcribe${queryString}`);
         ws.binaryType = 'arraybuffer';
 
         ws.onopen = function(event) {
@@ -92,10 +235,39 @@
         ws.onmessage = function(evt) {
             console.log('Received message: ' + evt.data);
             try {
-                resJson = JSON.parse(evt.data)
+                var resJson = JSON.parse(evt.data);
+                
                 if (resJson.code == 0) {
-                    var jsonResponse = JSON.stringify(resJson, null, 4);
-                    transcriptionResult.textContent += "\n" + (resJson.data || 'No speech recognized');
+                    // 解析 ASR 结果
+                    var info = JSON.parse(resJson.info);
+                    var mode = info.mode;
+                    var text = resJson.data || 'No speech recognized';
+                    var is_final = info.is_final;
+                    
+                    console.log('ASR result - mode:', mode, 'text:', text, 'is_final:', is_final);
+                    
+                    // 根据模式处理结果显示
+                    if (mode === "2pass-offline" || mode === "offline") {
+                        // 离线结果：覆盖之前的内容
+                        offline_text = offline_text + text;
+                        rec_text = offline_text;
+                    } else if (mode === "2pass-online" || mode === "online") {
+                        // 在线结果：追加显示（给用户即时反馈）
+                        rec_text = rec_text + text;
+                    } else {
+                        // 其他模式：直接追加
+                        rec_text = rec_text + text;
+                    }
+                    
+                    // 更新显示
+                    transcriptionResult.textContent = rec_text;
+                    
+                } else if (resJson.code == 2) {
+                    // 说话人验证或语音检测结果
+                    console.log('Detection result:', resJson.info, resJson.data);
+                    if (resJson.info === "detect speaker") {
+                        console.log('Detected speaker:', resJson.data);
+                    }
                 }
             } catch (e) {
                 console.error('Failed to parse response data', e);
@@ -126,6 +298,10 @@
         recordButton.textContent = "Start Recording";
         recordButton.classList.remove("recording");
         isRecording = false;
+        
+        // 清理文本状态
+        rec_text = "";
+        offline_text = "";
     }
 
     function init(rec) {
@@ -232,6 +408,311 @@
             audioData.input(resampledData);
         };
     };
+
+    // 音频录制器类（用于保存音频文件）
+    var AudioRecorder = function(stream) {
+        var context = new AudioContext();
+        var audioInput = context.createMediaStreamSource(stream);
+        var recorder = context.createScriptProcessor(4096, 1, 1);
+        var audioBuffer = [];
+
+        this.start = function() {
+            audioInput.connect(recorder);
+            recorder.connect(context.destination);
+            audioBuffer = [];
+        };
+
+        this.stop = function() {
+            recorder.disconnect();
+            audioInput.disconnect();
+        };
+
+        this.getWAVBlob = function() {
+            var buffer = mergeBuffers(audioBuffer);
+            var resampledBuffer = downsampleBufferLocal(buffer, context.sampleRate, 16000);
+            return encodeWAV(resampledBuffer, 16000);
+        };
+
+        function downsampleBufferLocal(buffer, inputSampleRate, outputSampleRate) {
+            if (outputSampleRate === inputSampleRate) {
+                return buffer;
+            }
+            var sampleRateRatio = inputSampleRate / outputSampleRate;
+            var newLength = Math.round(buffer.length / sampleRateRatio);
+            var result = new Float32Array(newLength);
+            var offsetResult = 0;
+            var offsetBuffer = 0;
+            while (offsetResult < result.length) {
+                var nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+                var accum = 0, count = 0;
+                for (var i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+                    accum += buffer[i];
+                    count++;
+                }
+                result[offsetResult] = accum / count;
+                offsetResult++;
+                offsetBuffer = nextOffsetBuffer;
+            }
+            return result;
+        }
+
+        this.clear = function() {
+            audioBuffer = [];
+        };
+
+        function mergeBuffers(buffers) {
+            var totalLength = 0;
+            for (var i = 0; i < buffers.length; i++) {
+                totalLength += buffers[i].length;
+            }
+            var result = new Float32Array(totalLength);
+            var offset = 0;
+            for (var i = 0; i < buffers.length; i++) {
+                result.set(buffers[i], offset);
+                offset += buffers[i].length;
+            }
+            return result;
+        }
+
+        function encodeWAV(samples, sampleRate) {
+            var buffer = new ArrayBuffer(44 + samples.length * 2);
+            var view = new DataView(buffer);
+
+            // WAV 文件头
+            writeString(view, 0, 'RIFF');
+            view.setUint32(4, 36 + samples.length * 2, true);
+            writeString(view, 8, 'WAVE');
+            writeString(view, 12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);
+            view.setUint16(22, 1, true); // 单声道
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * 2, true);
+            view.setUint16(32, 2, true);
+            view.setUint16(34, 16, true); // 16位
+            writeString(view, 36, 'data');
+            view.setUint32(40, samples.length * 2, true);
+
+            // 写入音频数据
+            var offset = 44;
+            for (var i = 0; i < samples.length; i++, offset += 2) {
+                var s = Math.max(-1, Math.min(1, samples[i]));
+                view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+            }
+
+            return new Blob([view], { type: 'audio/wav' });
+        }
+
+        function writeString(view, offset, string) {
+            for (var i = 0; i < string.length; i++) {
+                view.setUint8(offset + i, string.charCodeAt(i));
+            }
+        }
+
+        recorder.onaudioprocess = function(e) {
+            audioBuffer.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+        };
+    };
+
+    // 开始录制音频
+    function startAudioRecording() {
+        if (!navigator.getUserMedia) {
+            alert('您的浏览器不支持音频录制');
+            return;
+        }
+
+        navigator.getUserMedia(
+            { audio: true },
+            function(stream) {
+                audioRecorder = new AudioRecorder(stream);
+                audioRecorder.start();
+                isRecordingAudio = true;
+                
+                document.getElementById('recordAudioButton').textContent = '停止录制';
+                document.getElementById('recordAudioButton').style.backgroundColor = 'red';
+                document.getElementById('recordingStatus').textContent = '正在录制...';
+                document.getElementById('saveAudioButton').disabled = true;
+            },
+            function(error) {
+                console.error('获取音频流失败:', error);
+                alert('无法访问麦克风');
+            }
+        );
+    }
+
+    // 停止录制音频
+    function stopAudioRecording() {
+        if (audioRecorder && isRecordingAudio) {
+            audioRecorder.stop();
+            recordedAudioData = audioRecorder.getWAVBlob();
+            isRecordingAudio = false;
+            
+            document.getElementById('recordAudioButton').textContent = '开始录制音频';
+            document.getElementById('recordAudioButton').style.backgroundColor = '';
+            document.getElementById('recordingStatus').textContent = '录制完成';
+            document.getElementById('saveAudioButton').disabled = false;
+        }
+    }
+
+    // 转换并上传音频文件
+    function convertAndUploadAudio(file, fileName) {
+        var reader = new FileReader();
+        reader.onload = function(e) {
+            var audioContext = new AudioContext();
+            audioContext.decodeAudioData(e.target.result)
+                .then(function(audioBuffer) {
+                    // 转换为16000Hz单声道
+                    var resampledData = resampleAudioBuffer(audioBuffer, 16000);
+                    var wavBlob = encodeWAVFromBuffer(resampledData, 16000);
+                    uploadAudioToServer(wavBlob, fileName);
+                })
+                .catch(function(error) {
+                    console.error('音频解码失败:', error);
+                    alert('音频文件格式不支持');
+                });
+        };
+        reader.readAsArrayBuffer(file);
+    }
+
+    // 保存录制的音频
+    function saveRecordedAudio(fileName) {
+        uploadAudioToServer(recordedAudioData, fileName);
+    }
+
+    // 上传音频到服务器
+    function uploadAudioToServer(audioBlob, fileName) {
+        var formData = new FormData();
+        formData.append('audio', audioBlob, fileName + '.wav');
+        formData.append('fileName', fileName);
+
+        fetch('http://localhost:27000/upload-audio', {
+            method: 'POST',
+            body: formData
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                alert('音频上传成功: ' + data.filePath);
+            } else {
+                alert('上传失败: ' + data.message);
+            }
+        })
+        .catch(error => {
+            console.error('上传错误:', error);
+            alert('上传失败');
+        });
+    }
+
+    // 重采样音频缓冲区
+    function resampleAudioBuffer(audioBuffer, targetSampleRate) {
+        var sourceSampleRate = audioBuffer.sampleRate;
+        var sourceData = audioBuffer.getChannelData(0); // 获取第一个声道
+        
+        if (sourceSampleRate === targetSampleRate) {
+            return sourceData;
+        }
+        
+        var sampleRateRatio = sourceSampleRate / targetSampleRate;
+        var newLength = Math.round(sourceData.length / sampleRateRatio);
+        var result = new Float32Array(newLength);
+        
+        for (var i = 0; i < newLength; i++) {
+            var sourceIndex = i * sampleRateRatio;
+            var index = Math.floor(sourceIndex);
+            var fraction = sourceIndex - index;
+            
+            if (index + 1 < sourceData.length) {
+                result[i] = sourceData[index] * (1 - fraction) + sourceData[index + 1] * fraction;
+            } else {
+                result[i] = sourceData[index];
+            }
+        }
+        
+        return result;
+    }
+
+    // 从缓冲区编码WAV
+    function encodeWAVFromBuffer(samples, sampleRate) {
+        var buffer = new ArrayBuffer(44 + samples.length * 2);
+        var view = new DataView(buffer);
+
+        // WAV 文件头
+        writeString(view, 0, 'RIFF');
+        view.setUint32(4, 36 + samples.length * 2, true);
+        writeString(view, 8, 'WAVE');
+        writeString(view, 12, 'fmt ');
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, 1, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, sampleRate * 2, true);
+        view.setUint16(32, 2, true);
+        view.setUint16(34, 16, true);
+        writeString(view, 36, 'data');
+        view.setUint32(40, samples.length * 2, true);
+
+        var offset = 44;
+        for (var i = 0; i < samples.length; i++, offset += 2) {
+            var s = Math.max(-1, Math.min(1, samples[i]));
+            view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+        }
+
+        return new Blob([view], { type: 'audio/wav' });
+
+        function writeString(view, offset, string) {
+            for (var i = 0; i < string.length; i++) {
+                view.setUint8(offset + i, string.charCodeAt(i));
+            }
+        }
+    }
+
+    // 加载说话人列表
+    function loadSpeakers() {
+        fetch('http://localhost:27000/speakers')
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    availableSpeakers = data.speakers;
+                    displaySpeakers();
+                } else {
+                    console.error('获取说话人列表失败');
+                    document.getElementById('speakerList').innerHTML = '<div style="color: red;">获取说话人列表失败</div>';
+                }
+            })
+            .catch(error => {
+                console.error('加载说话人列表错误:', error);
+                document.getElementById('speakerList').innerHTML = '<div style="color: red;">加载说话人列表错误</div>';
+            });
+    }
+
+    // 显示说话人列表
+    function displaySpeakers() {
+        var speakerList = document.getElementById('speakerList');
+        if (availableSpeakers.length === 0) {
+            speakerList.innerHTML = '<div style="color: #666;">没有找到说话人音频文件</div>';
+            return;
+        }
+
+        var html = '';
+        for (var i = 0; i < availableSpeakers.length; i++) {
+            var speaker = availableSpeakers[i];
+            html += '<label style="display: block; margin-bottom: 3px;">';
+            html += '<input type="checkbox" name="speaker" value="' + speaker + '" checked> ';
+            html += speaker;
+            html += '</label>';
+        }
+        speakerList.innerHTML = html;
+    }
+
+    // 获取选择的说话人
+    function getSelectedSpeakers() {
+        var checkboxes = document.querySelectorAll('input[name="speaker"]:checked');
+        var selected = [];
+        for (var i = 0; i < checkboxes.length; i++) {
+            selected.push(checkboxes[i].value);
+        }
+        return selected;
+    }
 
 </script>
 </html>

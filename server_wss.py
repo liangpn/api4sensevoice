@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, UploadFile, File, Form
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -159,28 +159,36 @@ def contains_chinese_english_number(s: str) -> bool:
 
 sv_pipeline = pipeline(
     task='speaker-verification',
-    model='iic/speech_eres2net_large_sv_zh-cn_3dspeaker_16k',
+    model='/Users/liangpn/models/speech_eres2net_large_sv_zh-cn_3dspeaker_16k',
     model_revision='v1.0.0'
 )
 
 asr_pipeline = pipeline(
     task=Tasks.auto_speech_recognition,
-    model='iic/SenseVoiceSmall',
+    model='/Users/liangpn/models/SenseVoiceSmall',
     model_revision="master",
-    device="cuda:0",
+    device="cpu",
     disable_update=True
 )
 
-model_asr = AutoModel(
-    model="iic/SenseVoiceSmall",
+# 离线 ASR 模型（精确结果）- 支持热词的 Contextual-Paraformer
+model_asr_offline = AutoModel(
+    model="iic/speech_paraformer-large-contextual_asr_nat-zh-cn-16k-common-vocab8404",
+    device="cpu",
+    disable_update=True
+)
+
+# 在线 ASR 模型（快速结果）- 使用 SenseVoice 保持速度
+model_asr_online = AutoModel(
+    model="/Users/liangpn/models/SenseVoiceSmall",
     trust_remote_code=True,
     remote_code="./model.py",    
-    device="cuda:0",
+    device="cpu",
     disable_update=True
 )
 
 model_vad = AutoModel(
-    model="fsmn-vad",
+    model="/Users/liangpn/models/speech_fsmn_vad_zh-cn-16k-common-pytorch",
     model_revision="v2.0.4",
     disable_pbar = True,
     max_end_silence_time=500,
@@ -188,39 +196,75 @@ model_vad = AutoModel(
     disable_update=True,
 )
 
-reg_spks_files = [
-    "speaker/speaker1_a_cn_16k.wav"
-]
+def get_speaker_files():
+    """动态获取speaker目录下的所有音频文件"""
+    speaker_dir = "speaker"
+    if not os.path.exists(speaker_dir):
+        return []
+    
+    audio_extensions = ['.wav']
+    files = []
+    for file in os.listdir(speaker_dir):
+        if any(file.lower().endswith(ext) for ext in audio_extensions):
+            files.append(os.path.join(speaker_dir, file))
+    return files
 
 def reg_spk_init(files):
     reg_spk = {}
     for f in files:
-        data, sr = sf.read(f, dtype="float32")
-        k, _ = os.path.splitext(os.path.basename(f))
-        reg_spk[k] = {
-            "data": data,
-            "sr":   sr,
-        }
+        try:
+            data, sr = sf.read(f, dtype="float32")
+            k, _ = os.path.splitext(os.path.basename(f))
+            reg_spk[k] = {
+                "data": data,
+                "sr":   sr,
+            }
+            logger.info(f"加载说话人音频文件: {f}")
+        except Exception as e:
+            logger.error(f"无法加载音频文件 {f}: {e}")
     return reg_spk
 
+# 动态加载speaker目录下的音频文件
+reg_spks_files = get_speaker_files()
 reg_spks = reg_spk_init(reg_spks_files)
 
-def speaker_verify(audio, sv_thr):
+def speaker_verify(audio, sv_thr, selected_speakers=None):
+    """
+    说话人验证
+    :param audio: 音频数据
+    :param sv_thr: 验证阈值
+    :param selected_speakers: 选择的说话人列表，如果为None则验证所有说话人
+    :return: (是否匹配, 匹配的说话人名称)
+    """
     hit = False
-    for k, v in reg_spks.items():
+    matched_speaker = None
+    
+    # 如果没有指定说话人，验证所有说话人
+    speakers_to_verify = selected_speakers if selected_speakers else list(reg_spks.keys())
+    
+    for k in speakers_to_verify:
+        if k not in reg_spks:
+            continue
+            
+        v = reg_spks[k]
         res_sv = sv_pipeline([audio, v["data"]], sv_thr)
         if res_sv["score"] >= sv_thr:
            hit = True
-        logger.info(f"[speaker_verify] audio_len: {len(audio)}; sv_thr: {sv_thr}; hit: {hit}; {k}: {res_sv}")
-    return hit, k
+           matched_speaker = k
+        logger.info(f"[speaker_verify] audio_len: {len(audio)}; sv_thr: {sv_thr}; speaker: {k}; score: {res_sv['score']:.3f}; hit: {hit}")
+        
+        # 如果找到匹配的说话人，可以选择立即返回或继续验证其他说话人
+        if hit:
+            break
+    
+    return hit, matched_speaker
 
 
-def asr(audio, lang, cache, use_itn=False):
-    # with open('test.pcm', 'ab') as f:
-    #     logger.debug(f'write {f.write(audio)} bytes to `test.pcm`')
-    # result = asr_pipeline(audio, lang)
+def asr_online(audio, lang, cache, use_itn=False, hotwords=None):
+    """在线 ASR - 快速结果"""
     start_time = time.time()
-    result = model_asr.generate(
+    # SenseVoice 不支持热词，所以在线模式不使用热词
+    result = model_asr_online.generate(
         input           = audio,
         cache           = cache,
         language        = lang.strip(),
@@ -229,7 +273,31 @@ def asr(audio, lang, cache, use_itn=False):
     )
     end_time = time.time()
     elapsed_time = end_time - start_time
-    logger.debug(f"asr elapsed: {elapsed_time * 1000:.2f} milliseconds")
+    logger.debug(f"online asr elapsed: {elapsed_time * 1000:.2f} milliseconds")
+    return result
+
+def asr_offline(audio, lang, cache, use_itn=False, hotwords=None):
+    """离线 ASR - 精确结果，支持热词"""
+    start_time = time.time()
+    
+    # 构建参数
+    params = {
+        'input': audio,
+        'cache': cache,
+        'language': lang.strip(),
+        'use_itn': use_itn,
+        'batch_size_s': 60,
+    }
+    
+    # 如果有热词，添加到参数中
+    if hotwords and hotwords.strip():
+        params['hotword'] = hotwords.strip()
+        logger.info(f"Using hotwords: '{hotwords.strip()}'")
+    
+    result = model_asr_offline.generate(**params)
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    logger.debug(f"offline asr elapsed: {elapsed_time * 1000:.2f} milliseconds")
     return result
 
 app = FastAPI()
@@ -273,12 +341,30 @@ class TranscriptionResponse(BaseModel):
     info: str
     data: str
 
+class UploadResponse(BaseModel):
+    success: bool
+    message: str
+    filePath: str = ""
+
+class SpeakerListResponse(BaseModel):
+    success: bool
+    speakers: list[str] = []
+
 @app.websocket("/ws/transcribe")
 async def websocket_endpoint(websocket: WebSocket):
     try:
         query_params = parse_qs(websocket.scope['query_string'].decode())
         sv = query_params.get('sv', ['false'])[0].lower() in ['true', '1', 't', 'y', 'yes']
         lang = query_params.get('lang', ['auto'])[0].lower()
+        mode = query_params.get('mode', ['offline'])[0].lower()  # 新增：获取模式参数
+        hotwords = query_params.get('hotwords', [''])[0]  # 新增：获取热词参数
+        selected_speakers = query_params.get('speakers', [])
+        if selected_speakers and selected_speakers[0]:
+            selected_speakers = selected_speakers[0].split(',')
+        else:
+            selected_speakers = None
+        
+        logger.info(f"WebSocket connection - sv: {sv}, lang: {lang}, mode: {mode}, hotwords: '{hotwords}', speakers: {selected_speakers}")
         
         await websocket.accept()
         chunk_size = int(config.chunk_size_ms * config.sample_rate / 1000)
@@ -286,7 +372,8 @@ async def websocket_endpoint(websocket: WebSocket):
         audio_vad = np.array([], dtype=np.float32)
 
         cache = {}
-        cache_asr = {}
+        cache_asr_online = {}  # 在线 ASR 缓存
+        cache_asr_offline = {}  # 离线 ASR 缓存
         last_vad_beg = last_vad_end = -1
         offset = 0
         hit = False
@@ -325,7 +412,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         # If no hit is detected, continue accumulating audio data and check again until a hit is detected
                         # `hit` will reset after `asr`.
                         if not hit:
-                            hit, speaker = speaker_verify(audio_vad[int((last_vad_beg - offset) * config.sample_rate / 1000):], config.sv_thr)
+                            hit, speaker = speaker_verify(audio_vad[int((last_vad_beg - offset) * config.sample_rate / 1000):], config.sv_thr, selected_speakers)
                             if hit:
                                 response = TranscriptionResponse(
                                     code=2,
@@ -356,20 +443,92 @@ async def websocket_endpoint(websocket: WebSocket):
                             offset += last_vad_end
                             beg = int(last_vad_beg * config.sample_rate / 1000)
                             end = int(last_vad_end * config.sample_rate / 1000)
+                            audio_segment = audio_vad[beg:end]
                             logger.info(f"[vad segment] audio_len: {end - beg}")
-                            result = None if sv and not hit else asr(audio_vad[beg:end], lang.strip(), cache_asr, True)
-                            logger.info(f"asr response: {result}")
+                            
+                            # 说话人验证（如果启用）
+                            should_process_asr = True
+                            if sv and not hit:
+                                logger.info(f"Speaker verification FAILED, skipping ASR for this segment")
+                                should_process_asr = False
+                            elif sv and hit:
+                                logger.info(f"Speaker verification PASSED, processing ASR")
+                            
+                            # 只有验证通过的音频才进行 ASR
+                            if should_process_asr:
+                                if mode == "2pass":
+                                    # 2pass 模式：先发送在线结果，再发送离线结果
+                                    
+                                    # 1. 在线 ASR（快速结果）
+                                    online_result = asr_online(audio_segment, lang.strip(), cache_asr_online, False, hotwords)
+                                    logger.info(f"online asr response: {online_result}")
+                                    
+                                    if online_result and online_result[0]['text'].strip():
+                                        response = TranscriptionResponse(
+                                            code=0,
+                                            info=json.dumps({
+                                                **online_result[0],
+                                                "mode": "2pass-online",
+                                                "is_final": False
+                                            }, ensure_ascii=False),
+                                            data=format_str_v3(online_result[0]['text'])
+                                        )
+                                        await websocket.send_json(response.model_dump())
+                                    
+                                    # 2. 离线 ASR（精确结果，支持热词）
+                                    offline_result = asr_offline(audio_segment, lang.strip(), cache_asr_offline, True, hotwords)
+                                    logger.info(f"offline asr response: {offline_result}")
+                                    
+                                    if offline_result and offline_result[0]['text'].strip():
+                                        response = TranscriptionResponse(
+                                            code=0,
+                                            info=json.dumps({
+                                                **offline_result[0],
+                                                "mode": "2pass-offline",
+                                                "is_final": True
+                                            }, ensure_ascii=False),
+                                            data=format_str_v3(offline_result[0]['text'])
+                                        )
+                                        await websocket.send_json(response.model_dump())
+                                        
+                                elif mode == "online":
+                                    # 仅在线模式
+                                    result = asr_online(audio_segment, lang.strip(), cache_asr_online, False, hotwords)
+                                    logger.info(f"online asr response: {result}")
+                                    
+                                    if result and result[0]['text'].strip():
+                                        response = TranscriptionResponse(
+                                            code=0,
+                                            info=json.dumps({
+                                                **result[0],
+                                                "mode": "online",
+                                                "is_final": True
+                                            }, ensure_ascii=False),
+                                            data=format_str_v3(result[0]['text'])
+                                        )
+                                        await websocket.send_json(response.model_dump())
+                                        
+                                else:  # offline 模式（默认）
+                                    # 仅离线模式，支持热词
+                                    result = asr_offline(audio_segment, lang.strip(), cache_asr_offline, True, hotwords)
+                                    logger.info(f"offline asr response: {result}")
+                                    
+                                    if result and result[0]['text'].strip():
+                                        response = TranscriptionResponse(
+                                            code=0,
+                                            info=json.dumps({
+                                                **result[0],
+                                                "mode": "offline",
+                                                "is_final": True
+                                            }, ensure_ascii=False),
+                                            data=format_str_v3(result[0]['text'])
+                                        )
+                                        await websocket.send_json(response.model_dump())
+                            
+                            # 清理状态
                             audio_vad = audio_vad[end:]
                             last_vad_beg = last_vad_end = -1
                             hit = False
-                            
-                            if  result is not None:
-                                response = TranscriptionResponse(
-                                    code=0,
-                                    info=json.dumps(result[0], ensure_ascii=False),
-                                    data=format_str_v3(result[0]['text'])
-                                )
-                                await websocket.send_json(response.model_dump())
                                 
                         # logger.debug(f'last_vad_beg: {last_vad_beg}; last_vad_end: {last_vad_end} len(audio_vad): {len(audio_vad)}')
 
@@ -385,11 +544,68 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info("Cleaned up resources after WebSocket disconnect")
 
 
+@app.post("/upload-audio", response_model=UploadResponse)
+async def upload_audio(audio: UploadFile = File(...), fileName: str = Form(...)):
+    try:
+        # 确保speaker目录存在
+        speaker_dir = "speaker"
+        if not os.path.exists(speaker_dir):
+            os.makedirs(speaker_dir)
+        
+        # 构建文件路径
+        file_path = os.path.join(speaker_dir, f"{fileName}.wav")
+        
+        # 保存上传的文件
+        with open(file_path, "wb") as buffer:
+            content = await audio.read()
+            buffer.write(content)
+        
+        logger.info(f"音频文件已保存: {file_path}")
+        
+        return UploadResponse(
+            success=True,
+            message="音频上传成功",
+            filePath=file_path
+        )
+        
+    except Exception as e:
+        logger.error(f"音频上传失败: {e}")
+        return UploadResponse(
+            success=False,
+            message=f"上传失败: {str(e)}"
+        )
+
+
+@app.get("/speakers", response_model=SpeakerListResponse)
+async def get_speakers():
+    """获取可用的说话人列表"""
+    try:
+        # 重新加载说话人文件
+        global reg_spks, reg_spks_files
+        reg_spks_files = get_speaker_files()
+        reg_spks = reg_spk_init(reg_spks_files)
+        
+        speakers = list(reg_spks.keys())
+        return SpeakerListResponse(
+            success=True,
+            speakers=speakers
+        )
+    except Exception as e:
+        logger.error(f"获取说话人列表失败: {e}")
+        return SpeakerListResponse(
+            success=False,
+            speakers=[]
+        )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the FastAPI app with a specified port.")
     parser.add_argument('--port', type=int, default=27000, help='Port number to run the FastAPI app on.')
-    # parser.add_argument('--certfile', type=str, default='path_to_your_SSL_certificate_file.crt', help='SSL certificate file')
-    # parser.add_argument('--keyfile', type=str, default='path_to_your_SSL_certificate_file.key', help='SSL key file')
+    parser.add_argument('--certfile', type=str, help='SSL certificate file')
+    parser.add_argument('--keyfile', type=str, help='SSL key file')
     args = parser.parse_args()
-    # uvicorn.run(app, host="0.0.0.0", port=args.port, ssl_certfile=args.certfile, ssl_keyfile=args.keyfile)
-    uvicorn.run(app, host="0.0.0.0", port=args.port)
+    
+    if args.certfile and args.keyfile:
+        uvicorn.run(app, host="0.0.0.0", port=args.port, ssl_certfile=args.certfile, ssl_keyfile=args.keyfile)
+    else:
+        uvicorn.run(app, host="0.0.0.0", port=args.port)
