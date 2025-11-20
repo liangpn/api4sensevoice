@@ -1,13 +1,11 @@
 fastapi
 funasr
-modelscope==1.17.1
+modelscope
 numpy<=1.26.4
 pydantic
 pydantic_settings
 soundfile
 starlette
-torch<=2.3
-torchaudio
 uvicorn
 addict
 datasets==2.21.0

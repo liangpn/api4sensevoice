@@ -315,14 +315,35 @@ ws.onmessage = function(evt) {
 ### 环境要求
 
 ```bash
-# Python 依赖
-pip install fastapi uvicorn websockets
-pip install funasr modelscope soundfile numpy
-pip install loguru pydantic-settings
-
 # 模型下载
 # 说话人验证模型、SenseVoice、VAD 模型需要预先下载
 ```
+
+### PyTorch 安装（根据平台选择）
+#### CPU 版本（所有平台通用）
+```bash
+uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+```
+
+#### GPU 版本（需要 NVIDIA GPU）
+```bash
+#确认cuda版本
+nvcc -V 
+
+# 然后根据 CUDA 版本安装（例如 CUDA 12.1）：
+uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+```
+### 安装其他依赖（使用阿里云镜像加速）
+```bash
+uv pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+```
+
+### 验证安装
+```bash
+python -c "import torch; print(f'PyTorch Version: {torch.__version__}'); print(f'CUDA Available: {torch.cuda.is_available()}'); print(f'CUDA Version: {torch.version.cuda}')"
+```
+
 
 ### 启动服务
 
@@ -391,6 +412,5 @@ speaker/
 
 ---
 
-**实现日期**: 2025-01-22  
 **技术栈**: Python + FunASR + ModelScope + FastAPI + WebSocket  
 **状态**: ✅ 已完成并测试

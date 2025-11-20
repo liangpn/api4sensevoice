@@ -102,6 +102,21 @@ lang_dict =  {
 emo_set = {"😊", "😔", "😡", "😰", "🤢", "😮"}
 event_set = {"🎼", "👏", "😀", "😭", "🤧", "😷",}
 
+# windows 模型路径
+sv_model_path = "D:/ai/models/speech_eres2net_large_sv_zh-cn_3dspeaker_16k"
+asr_model_path = "D:/ai/models/SenseVoiceSmall"
+asr_offline_model_path = "D:/ai/models/speech_paraformer-large-contextual_asr_nat-zh-cn-16k-common-vocab8404"
+asr_online_model_path = "D:/ai/models/SenseVoiceSmall"
+vad_model_path = "D:/ai/models/speech_fsmn_vad_zh-cn-16k-common-pytorch"
+
+# Mac|Linux 模型路径
+# sv_model_path = "/Users/liangpn/models/speech_eres2net_large_sv_zh-cn_3dspeaker_16k"
+# asr_model_path = "/Users/liangpn/models/SenseVoiceSmall"
+# asr_offline_model_path = "/Users/liangpn/models/speech_paraformer-large-contextual_asr_nat-zh-cn-16k-common-vocab8404"
+# asr_online_model_path = "/Users/liangpn/models/SenseVoiceSmall"
+# vad_model_path = "/Users/liangpn/models/speech_fsmn_vad_zh-cn-16k-common-pytorch"
+
+
 def format_str(s):
 	for sptk in emoji_dict:
 		s = s.replace(sptk, emoji_dict[sptk])
@@ -159,36 +174,36 @@ def contains_chinese_english_number(s: str) -> bool:
 
 sv_pipeline = pipeline(
     task='speaker-verification',
-    model='/Users/liangpn/models/speech_eres2net_large_sv_zh-cn_3dspeaker_16k',
+    model=sv_model_path,
     model_revision='v1.0.0'
 )
 
 asr_pipeline = pipeline(
     task=Tasks.auto_speech_recognition,
-    model='/Users/liangpn/models/SenseVoiceSmall',
+    model=asr_model_path,
     model_revision="master",
-    device="cpu",
+    # device="cuda:0", # 默认使用gpu, cuda:0 指定gpu 、cpu mac或者没有gpu使用
     disable_update=True
 )
 
 # 离线 ASR 模型（精确结果）- 支持热词的 Contextual-Paraformer
 model_asr_offline = AutoModel(
-    model="iic/speech_paraformer-large-contextual_asr_nat-zh-cn-16k-common-vocab8404",
-    device="cpu",
+    model=asr_offline_model_path,
+    # device="cuda:0",
     disable_update=True
 )
 
 # 在线 ASR 模型（快速结果）- 使用 SenseVoice 保持速度
 model_asr_online = AutoModel(
-    model="/Users/liangpn/models/SenseVoiceSmall",
+    model=asr_online_model_path,
     trust_remote_code=True,
     remote_code="./model.py",    
-    device="cpu",
+    # device="cuda:0",
     disable_update=True
 )
 
 model_vad = AutoModel(
-    model="/Users/liangpn/models/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+    model=vad_model_path,
     model_revision="v2.0.4",
     disable_pbar = True,
     max_end_silence_time=500,
